@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GCP 可用区中文标注
 // @namespace    http://tampermonkey.net/
-// @version      1.2.0
+// @version      1.2.1
 // @description  在 GCP Compute Engine 实例页面，自动将可用区（如 southamerica-west1-b）标注为对应的国家和城市（简体中文）
 // @author       You
 // @match        https://console.cloud.google.com/compute/instances*
@@ -126,6 +126,9 @@
     /**
      * 在可用区列之后插入一个平级的新表格列，并为所在表格的表头行补充对应标题单元格。
      * 每张表格只执行一次表头插入（通过 HEADER_ANNOTATED WeakSet 追踪）。
+     *
+     * 优先通过 data-column-id="zoneForFilter" 或 aria-label="可用区" 定位表头列，
+     * 回退方案才使用列索引匹配，以应对 GCP Angular SPA 的实际 DOM 结构。
      */
     function addHeaderColumn(zoneCell) {
         const row = zoneCell.parentElement;
@@ -134,26 +137,29 @@
         const table = row.closest('table, [role="grid"], [role="treegrid"]');
         if (!table || HEADER_ANNOTATED.has(table)) return;
 
-        // 找到可用区列的索引
-        const colIndex = Array.from(row.children).indexOf(zoneCell);
-        if (colIndex < 0) return;
-
-        // 查找表头行：优先 thead > tr，其次含 columnheader 的 role="row"
-        const headerRow =
-            table.querySelector('thead tr') ||
-            table.querySelector('[role="row"]:has([role="columnheader"])');
-        if (!headerRow) return;
-
         // 避免重复插入
-        if (headerRow.querySelector(`.${LABEL_TH_CLASS}`)) {
+        if (table.querySelector(`.${LABEL_TH_CLASS}`)) {
             HEADER_ANNOTATED.add(table);
             return;
         }
 
-        const headerCells = Array.from(headerRow.children);
-        if (colIndex >= headerCells.length) return;
+        // 优先按 data-column-id 或 aria-label 定位可用区表头单元格
+        const refTh =
+            table.querySelector('[data-column-id="zoneForFilter"]') ||
+            table.querySelector('[role="columnheader"][aria-label="可用区"]') ||
+            (() => {
+                // 回退：用列索引匹配
+                const headerRow =
+                    table.querySelector('thead tr') ||
+                    table.querySelector('[role="row"]:has([role="columnheader"])');
+                if (!headerRow) return null;
+                const colIndex = Array.from(row.children).indexOf(zoneCell);
+                if (colIndex < 0) return null;
+                return Array.from(headerRow.children)[colIndex] ?? null;
+            })();
 
-        const refTh = headerCells[colIndex];
+        if (!refTh) return;
+
         const newTh = document.createElement(refTh.tagName.toLowerCase());
         newTh.className = LABEL_TH_CLASS;
         const refRole = refTh.getAttribute('role');
@@ -171,10 +177,12 @@
      *
      * GCP 实例列表的 DOM 结构（来自实际页面）：
      *   <td role="gridcell" style="white-space: nowrap;">
+     *     <gce2-zone-warning><!----></gce2-zone-warning>
      *     <!----> us-east1-c <!----><!---->
      *   </td>
      *
-     * 单元格内只有 Angular 注释节点 + 一个文本节点，textContent.trim() 即为可用区字符串。
+     * 单元格内含 Angular 注释节点 + 空的 <gce2-zone-warning> 子元素 + 文本节点，
+     * textContent.trim() 即为可用区字符串。
      */
     function scanPage() {
         // 同时覆盖 Angular cfc-table (<td role="gridcell">) 及原生 <td>
@@ -191,8 +199,10 @@
                 cell.removeAttribute(ZONE_ANNOTATED_ATTR);
             }
 
-            // 跳过含子元素的复杂单元格（Angular 注释节点不是 element，不影响此判断）
-            if (cell.children.length > 0) return;
+            // 跳过含有实质性子元素内容的复杂单元格（如含链接、按钮等）。
+            // 注意：GCP 的可用区单元格含有 <gce2-zone-warning> 空子元素，
+            // 其 textContent 为空，不应被视为复杂单元格。
+            if (Array.from(cell.children).some(el => el.textContent.trim() !== '')) return;
 
             const text = cell.textContent.trim();
             if (!isZoneString(text)) return;
